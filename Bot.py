@@ -1,6 +1,7 @@
 import sqlite3
 import re
 import asyncio
+import os
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
@@ -9,7 +10,11 @@ import threading
 import time
 
 # ========== КОНФИГ ==========
-BOT_TOKEN = "8971958515:AAGtIMt0aasMhCm_7V-YnUtw8xemn3u5PDE"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: BOT_TOKEN не найден!")
+    exit(1)
 
 # ГРУППЫ ДЛЯ СБОРА ЗАЯВОК
 SOURCE_GROUPS = [
@@ -21,17 +26,14 @@ SOURCE_GROUPS = [
     -1002619425684
 ]
 
-# ГРУППА ДЛЯ ВЫГРУЗКИ
 TARGET_GROUP = -1003901607049
-
 BATCH_SIZE = 40
 TOTAL_DISPATCHERS = 7
 DISPATCHER_NAMES = [f"Диспетчер {i}" for i in range(1, TOTAL_DISPATCHERS + 1)]
 
-# БЛОКИРОВКА ДЛЯ БД
 db_lock = threading.Lock()
 
-# ========== БАЗА ДАННЫХ С БЛОКИРОВКОЙ ==========
+# ========== РАБОТА С БД ==========
 def init_db():
     with db_lock:
         conn = sqlite3.connect('applications.db', timeout=20)
@@ -67,14 +69,12 @@ def init_db():
             )
         ''')
         
-        # Добавляем индекс для скорости
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_exported ON orders_history(is_exported)')
         
         conn.commit()
         conn.close()
 
 def execute_with_retry(func, *args, **kwargs):
-    """Выполняет функцию с повторными попытками при блокировке БД"""
     max_retries = 10
     for attempt in range(max_retries):
         try:
@@ -84,8 +84,6 @@ def execute_with_retry(func, *args, **kwargs):
             if "database is locked" in str(e) and attempt < max_retries - 1:
                 time.sleep(0.2 * (attempt + 1))
                 continue
-            raise
-        except Exception as e:
             raise
     return None
 
@@ -357,7 +355,6 @@ async def last_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     
-    # Проверяем группу
     if message.chat_id not in SOURCE_GROUPS:
         return
     
@@ -371,7 +368,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if f"@{bot_username}" not in text:
         return
     
-    # Парсим заявку
     pattern = r'@\w+\s+(?:№?\s*)?(\d+)\s+[г\.]?\s*([А-Яа-яёЁ\s\-]+)'
     match = re.search(pattern, text)
     
@@ -384,10 +380,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_city = re.sub(r'^г\.', '', raw_city)
     city = raw_city[0].upper() + raw_city[1:].lower()
     
-    # Назначаем диспетчера
     dispatcher = assign_dispatcher(city)
     
-    # Сохраняем с повторными попытками
     saved = False
     for attempt in range(5):
         try:
@@ -405,14 +399,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Ошибка сервера, попробуйте еще раз")
         return
     
-    # Ставим реакцию
     try:
         await message.set_reaction(reaction=["👌"])
     except Exception as e:
         print(f"⚠️ Реакция не работает: {e}")
         await message.reply_text("👌")
     
-    # Проверяем количество
     pending_count = get_pending_orders_count()
     print(f"📊 В очереди: {pending_count}/{BATCH_SIZE}")
     
@@ -450,21 +442,15 @@ async def export_to_dispatchers_group(bot):
     except Exception as e:
         print(f"❌ Ошибка выгрузки: {e}")
 
-# ========== ЗАПУСК ==========
-def main():
+# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+async def run_once():
+    """Запускаем бота на 25 минут"""
     print("=" * 50)
-    print("🚀 ЗАПУСК БОТА ДЛЯ СБОРА ЗАЯВОК")
+    print("🚀 ЗАПУСК БОТА")
     print("=" * 50)
-    print(f"\n📥 Групп-источников: {len(SOURCE_GROUPS)}")
-    for g in SOURCE_GROUPS:
-        print(f" → {g}")
-    print(f"\n📤 Группа-получатель: {TARGET_GROUP}")
-    print(f"\n🎯 Лимит заявок: {BATCH_SIZE}")
-    print(f"👥 Диспетчеров: {TOTAL_DISPATCHERS}")
-    print("\n" + "=" * 50)
     
     init_db()
-    print("✅ База данных готова\n")
+    print("✅ База данных готова")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -475,10 +461,37 @@ def main():
     application.add_handler(CommandHandler("last_report", last_report))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("✅ Бот готов!")
-    print("📝 Жду заявки...\n")
+    print("✅ Бот запущен на 25 МИНУТ")
+    print("📝 Жду заявки...")
     
-    application.run_polling()
+    # Запускаем бота
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Работаем 25 минут (1500 секунд)
+    await asyncio.sleep(1500)
+    
+    # Выключаемся
+    print("⏰ Время вышло, завершаем работу")
+    await application.updater.stop()
+    await application.shutdown()
+    
+    # Финальная выгрузка
+    pending = get_pending_orders_count()
+    if pending > 0:
+        print(f"📤 Финальная выгрузка {pending} заявок...")
+        await export_to_dispatchers_group(application.bot)
+    
+    print("✅ Бот остановлен")
+
+def main():
+    if not BOT_TOKEN:
+        print("❌ ОШИБКА: BOT_TOKEN не найден!")
+        print("Добавь секрет BOT_TOKEN в GitHub репозиторий")
+        return
+    
+    asyncio.run(run_once())
 
 if __name__ == "__main__":
     main()
